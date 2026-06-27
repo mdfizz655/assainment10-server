@@ -27,7 +27,9 @@ async function run() {
         const paymentsCollection = db.collection("payments");
         const reportsCollection = db.collection("reports");
 
-        // 1. JWT & Security
+        // ==========================================
+        // 1. JWT & Security Middlewares
+        // ==========================================
         app.post('/jwt', async (req, res) => {
             const user = req.body;
             const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: '1h' });
@@ -50,11 +52,11 @@ async function run() {
             next();
         };
 
-        // 2. Creator Stats API (আপনার ৪MD সমাধান)
+        // ==========================================
+        // 2. Creator Stats & Analytics
+        // ==========================================
         app.get('/creator-stats/:email', verifyToken, async (req, res) => {
             const email = req.params.email;
-            
-            // এগ্রিগেশন ব্যবহার করে স্ট্যাটাস বের করা
             const stats = await promptsCollection.aggregate([
                 { $match: { creatorEmail: email } },
                 {
@@ -67,18 +69,16 @@ async function run() {
                 }
             ]).toArray();
 
-            // চার্টের জন্য ডাটা
             const chartData = await promptsCollection.find({ creatorEmail: email })
                 .project({ title: 1, copyCount: 1, bookmarkCount: 1 })
                 .toArray();
 
-            res.send({ 
-                stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, 
-                chartData 
-            });
+            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, chartData });
         });
 
-        // 3. User & Roles
+        // ==========================================
+        // 3. User & Role Management
+        // ==========================================
         app.post('/users', async (req, res) => {
             const user = req.body;
             const existing = await usersCollection.findOne({ email: user.email });
@@ -98,7 +98,21 @@ async function run() {
             res.send(await usersCollection.find().toArray());
         });
 
-        // 4. Marketplace & Prompts
+        // ==========================================
+        // 4. Marketplace & Prompts (Home Page Fix Included)
+        // ==========================================
+        
+        // হোম পেজের জন্য লেটেস্ট ৬টি প্রম্পট (NEW ADDED)
+        app.get('/featured-prompts', async (req, res) => {
+            const query = { status: 'approved' };
+            const result = await promptsCollection
+                .find(query)
+                .limit(6)
+                .sort({ createdAt: -1 }) 
+                .toArray();
+            res.send(result);
+        });
+
         app.get('/prompts', async (req, res) => {
             const { search, category, aiTool, sort, page = 1, limit = 6 } = req.query;
             const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -140,7 +154,9 @@ async function run() {
             res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $inc: { copyCount: 1 } }));
         });
 
+        // ==========================================
         // 5. Reviews, Bookmarks & Reports
+        // ==========================================
         app.post('/reviews', verifyToken, async (req, res) => {
             res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
         });
@@ -154,14 +170,14 @@ async function run() {
         });
 
         app.post('/bookmarks', verifyToken, async (req, res) => {
-            const query = { userEmail: req.body.userEmail, promptId: req.body.promptId };
-            const exists = await bookmarksCollection.findOne(query);
-            if (exists) {
-                await bookmarksCollection.deleteOne(query);
-                res.send({ message: "removed" });
+            const { userEmail, promptId } = req.body;
+            const existing = await bookmarksCollection.findOne({ userEmail, promptId });
+            if (existing) {
+                await bookmarksCollection.deleteOne({ userEmail, promptId });
+                return res.send({ message: "removed" });
             } else {
                 await bookmarksCollection.insertOne({ ...req.body, date: new Date() });
-                res.send({ message: "saved" });
+                return res.send({ message: "saved" });
             }
         });
 
@@ -173,7 +189,9 @@ async function run() {
             res.send(await reportsCollection.insertOne({ ...req.body, date: new Date() }));
         });
 
-        // 6. Admin Actions
+        // ==========================================
+        // 6. Admin Moderation & Stats
+        // ==========================================
         app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await promptsCollection.find().toArray());
         });
@@ -196,15 +214,27 @@ async function run() {
             res.send(await paymentsCollection.find().sort({ date: -1 }).toArray());
         });
 
-        // 7. Payments
+        // ==========================================
+        // 7. Payments (Real & Simulation)
+        // ==========================================
         app.post('/simulate-payment', verifyToken, async (req, res) => {
             await paymentsCollection.insertOne({ email: req.decoded.email, amount: 5, date: new Date(), transactionId: `sim_${Date.now()}` });
             res.send(await usersCollection.updateOne({ email: req.decoded.email }, { $set: { status: 'Premium' } }));
         });
 
-        console.log("Neural Database is Synced and API Ready!");
+        app.post('/create-payment-intent', verifyToken, async (req, res) => {
+            const paymentIntent = await stripe.paymentIntents.create({ amount: parseInt(req.body.price * 100), currency: 'usd', payment_method_types: ['card'] });
+            res.send({ clientSecret: paymentIntent.client_secret });
+        });
+
+        app.post('/payments', verifyToken, async (req, res) => {
+            await paymentsCollection.insertOne(req.body);
+            res.send(await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } }));
+        });
+
+        console.log("Neural Database Sync: Success! API Ready.");
     } finally { }
 }
 run().catch(console.dir);
-app.get('/', (req, res) => res.send('API Running'));
-app.listen(port, () => console.log(`Neural Port ${port}`));
+app.get('/', (req, res) => res.send('API Online'));
+app.listen(port, () => console.log(`Running on ${port}`));
