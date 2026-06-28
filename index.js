@@ -9,21 +9,24 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==========================================
-// 1. CORS & Security (Fixed for Vercel/Render)
+// 1. ULTIMATE CORS & PREFLIGHT FIX (Nuclear Option)
 // ==========================================
 app.use(cors({
-    origin: true, 
+    origin: true, // যেকোনো অরিজিন এলাউ করবে যাতে Vercel/Localhost এ সমস্যা না হয়
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
 }));
 
-// Manual Preflight Header Injection
+// বিশেষ মিডলওয়্যার: এটি ম্যানুয়ালি ব্রাউজারের প্রি-ফ্লাইট চেক পাস করে দিবে
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', req.header('Origin'));
     res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.header('Access-Control-Allow-Credentials', 'true');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
     next();
 });
 
@@ -56,10 +59,12 @@ async function run() {
 
         const verifyToken = (req, res, next) => {
             const authHeader = req.headers.authorization;
-            if (!authHeader) return res.status(401).send({ message: 'unauthorized' });
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                return res.status(401).send({ message: 'No valid token provided' });
+            }
             const token = authHeader.split(' ')[1];
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) return res.status(401).send({ message: 'unauthorized' });
+                if (err) return res.status(401).send({ message: 'Invalid or expired token' });
                 req.decoded = decoded;
                 next();
             });
@@ -67,16 +72,16 @@ async function run() {
 
         const verifyAdmin = async (req, res, next) => {
             const user = await usersCollection.findOne({ email: req.decoded.email });
-            if (user?.role !== 'Admin') return res.status(403).send({ message: 'forbidden' });
+            if (user?.role !== 'Admin') return res.status(403).send({ message: 'Forbidden access' });
             next();
         };
 
         // ==========================================
-        // 3. User & Role APIs
+        // 3. User & Dynamic Statistics APIs
         // ==========================================
         app.post('/users', async (req, res) => {
             const existing = await usersCollection.findOne({ email: req.body.email });
-            if (existing) return res.send({ message: 'exists', insertedId: null });
+            if (existing) return res.send({ message: 'User exists', insertedId: null });
             res.send(await usersCollection.insertOne({ ...req.body, role: 'User', status: 'Free', createdAt: new Date() }));
         });
 
@@ -84,21 +89,10 @@ async function run() {
             res.send(await usersCollection.findOne({ email: req.params.email }));
         });
 
-        app.get('/users/me/:email', verifyToken, async (req, res) => {
-            res.send(await usersCollection.findOne({ email: req.params.email }));
-        });
-
-        app.get('/admin/all-users', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.find().toArray());
-        });
-
-        app.patch('/admin/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: req.body.role } }));
-        });
-
         app.get('/user-stats/:email', verifyToken, async (req, res) => {
-            const count = await promptsCollection.countDocuments({ creatorEmail: req.params.email });
-            const user = await usersCollection.findOne({ email: req.params.email });
+            const email = req.params.email;
+            const count = await promptsCollection.countDocuments({ creatorEmail: email });
+            const user = await usersCollection.findOne({ email });
             res.send({ promptCount: count, status: user?.status, role: user?.role });
         });
 
@@ -106,10 +100,19 @@ async function run() {
         // 4. Prompt Management (CRUD & 3-Limit Logic)
         // ==========================================
         app.post('/add-prompt', verifyToken, async (req, res) => {
-            const user = await usersCollection.findOne({ email: req.decoded.email });
-            const count = await promptsCollection.countDocuments({ creatorEmail: req.decoded.email });
-            if (user.status === 'Free' && count >= 3) return res.status(403).send({ message: 'limit-reached' });
-            res.send(await promptsCollection.insertOne({ ...req.body, creatorEmail: req.decoded.email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() }));
+            const email = req.decoded.email;
+            const user = await usersCollection.findOne({ email });
+            const count = await promptsCollection.countDocuments({ creatorEmail: email });
+
+            if (user.status === 'Free' && count >= 3) {
+                return res.status(403).send({ message: 'Limit reached' });
+            }
+            const newPrompt = { ...req.body, creatorEmail: email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() };
+            res.send(await promptsCollection.insertOne(newPrompt));
+        });
+
+        app.get('/my-prompts/:email', verifyToken, async (req, res) => {
+            res.send(await promptsCollection.find({ creatorEmail: req.params.email }).toArray());
         });
 
         app.patch('/prompts/:id', verifyToken, async (req, res) => {
@@ -120,34 +123,35 @@ async function run() {
             res.send(await promptsCollection.deleteOne({ _id: new ObjectId(req.params.id) }));
         });
 
-        app.get('/my-prompts/:email', verifyToken, async (req, res) => {
-            res.send(await promptsCollection.find({ creatorEmail: req.params.email }).toArray());
-        });
-
         app.patch('/prompts/copy-count/:id', async (req, res) => {
             res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $inc: { copyCount: 1 } }));
         });
 
         // ==========================================
-        // 5. Admin Moderation (Approval Fix)
+        // 5. Admin Moderation & Aggregation Stats
         // ==========================================
         app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await promptsCollection.find().toArray());
         });
 
         app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
+            const { status, feedback } = req.body;
+            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status, feedback: feedback || "" } }));
         });
 
-        app.patch('/admin/prompt-featured/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { isFeatured: req.body.featured } }));
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const stats = await promptsCollection.aggregate([{ $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, avgRating: { $avg: "$rating" } } }]).toArray();
+            const totalUsers = await usersCollection.countDocuments();
+            const totalRevenue = await paymentsCollection.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray();
+            res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
         });
 
-        app.delete('/admin/remove-prompt/:id', verifyToken, verifyAdmin, async (req, res) => {
-            const promptId = req.params.id;
-            await promptsCollection.deleteOne({ _id: new ObjectId(promptId) });
-            await reportsCollection.deleteMany({ promptId: promptId });
-            res.send({ message: "deleted" });
+        app.get('/admin/all-users', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await usersCollection.find().toArray());
+        });
+
+        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await paymentsCollection.find().sort({ date: -1 }).toArray());
         });
 
         // ==========================================
@@ -161,20 +165,14 @@ async function run() {
             res.send(await reviewsCollection.find({ promptId: req.params.id }).toArray());
         });
 
-        app.get('/my-reviews/:email', verifyToken, async (req, res) => {
-            res.send(await reviewsCollection.find({ reviewerEmail: req.params.email }).toArray());
-        });
-
         app.post('/bookmarks', verifyToken, async (req, res) => {
-            const query = { userEmail: req.body.userEmail, promptId: req.body.promptId };
-            const exists = await bookmarksCollection.findOne(query);
-            if (exists) {
-                await bookmarksCollection.deleteOne(query);
+            const { userEmail, promptId } = req.body;
+            const existing = await bookmarksCollection.findOne({ userEmail, promptId });
+            if (existing) {
+                await bookmarksCollection.deleteOne({ userEmail, promptId });
                 return res.send({ message: "removed" });
-            } else {
-                await bookmarksCollection.insertOne({ ...req.body, date: new Date() });
-                return res.send({ message: "saved" });
             }
+            res.send({ ...await bookmarksCollection.insertOne({ ...req.body, date: new Date() }), message: "saved" });
         });
 
         app.get('/bookmarks/:email', verifyToken, async (req, res) => {
@@ -189,43 +187,15 @@ async function run() {
             res.send(await reportsCollection.find().toArray());
         });
 
-        app.delete('/admin/reports/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await reportsCollection.deleteOne({ _id: new ObjectId(req.params.id) }));
-        });
-
         // ==========================================
-        // 7. Marketplace & Pagination
-        // ==========================================
-        app.get('/featured-prompts', async (req, res) => {
-            res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
-        });
-
-        app.get('/prompts', async (req, res) => {
-            const { search, category, aiTool, sort, page = 1, limit = 6 } = req.query;
-            const skip = (parseInt(page) - 1) * parseInt(limit);
-            let query = { status: 'approved' };
-            if (search) query.title = { $regex: search, $options: 'i' };
-            if (category) query.category = category;
-            if (aiTool) query.aiTool = aiTool;
-            let sortObj = { createdAt: -1 };
-            if (sort === 'popular') sortObj = { rating: -1 };
-            if (sort === 'copies') sortObj = { copyCount: -1 };
-            const result = await promptsCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray();
-            const total = await promptsCollection.countDocuments(query);
-            res.send({ result, total });
-        });
-
-        app.get('/prompts/:id', async (req, res) => {
-            res.send(await promptsCollection.findOne({ _id: new ObjectId(req.params.id) }));
-        });
-
-        // ==========================================
-        // 8. Payment APIs (Stripe & FULL Simulation)
+        // 7. Payment APIs (Real & Fixed Simulation)
         // ==========================================
         app.post('/simulate-payment', verifyToken, async (req, res) => {
             const email = req.decoded.email;
             const user = await usersCollection.findOne({ email });
-            const mockPayment = { email, userName: user?.name, amount: 5, transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Sandbox Simulation' };
+            const mockPayment = { 
+                email, userName: user?.name, amount: 5, transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Sandbox' 
+            };
             await paymentsCollection.insertOne(mockPayment);
             await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
             res.send({ success: true });
@@ -237,37 +207,45 @@ async function run() {
         });
 
         app.post('/payments', verifyToken, async (req, res) => {
-            await paymentsCollection.insertOne(req.body);
-            await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } });
+            const payment = req.body;
+            await paymentsCollection.insertOne(payment);
+            await usersCollection.updateOne({ email: payment.email }, { $set: { status: 'Premium' } });
             res.send({ success: true });
         });
 
-        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await paymentsCollection.find().sort({ date: -1 }).toArray());
-        });
-
         // ==========================================
-        // 9. Stats & Aggregation
+        // 8. Creator Stats & Analytics
         // ==========================================
-        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
-            const stats = await promptsCollection.aggregate([{ $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, avgRating: { $avg: "$rating" } } }]).toArray();
-            const totalUsers = await usersCollection.countDocuments();
-            const totalRevenue = await paymentsCollection.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray();
-            res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
-        });
-
         app.get('/creator-stats/:email', verifyToken, async (req, res) => {
+            const email = req.params.email;
             const stats = await promptsCollection.aggregate([
-                { $match: { creatorEmail: req.params.email } },
+                { $match: { creatorEmail: email } },
                 { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" } } }
             ]).toArray();
-            const chartData = await promptsCollection.find({ creatorEmail: req.params.email }).project({ title: 1, copyCount: 1, bookmarkCount: 1 }).toArray();
+            const chartData = await promptsCollection.find({ creatorEmail: email }).project({ title: 1, copyCount: 1 }).toArray();
             res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0 }, chartData });
         });
 
-        console.log("PROMPTLY Master Backend Ready ✅");
+        // ==========================================
+        // 9. Marketplace & Home Page
+        // ==========================================
+        app.get('/featured-prompts', async (req, res) => {
+            res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
+        });
+
+        app.get('/prompts', async (req, res) => {
+            const { search, category, aiTool, sort } = req.query;
+            let query = { status: 'approved' };
+            if (search) query.title = { $regex: search, $options: 'i' };
+            if (category) query.category = category;
+            if (aiTool) query.aiTool = aiTool;
+            const result = await promptsCollection.find(query).toArray();
+            res.send({ result });
+        });
+
+        console.log("Database Operational: Master Mainframe Ready ✅");
     } finally { }
 }
 run().catch(console.dir);
-app.get('/', (req, res) => res.send('API Sync Active'));
-app.listen(port, () => console.log(`Neural Port ${port}`));
+app.get('/', (req, res) => res.send('API Online'));
+app.listen(port, () => console.log(`Listening on ${port}`));
