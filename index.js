@@ -230,19 +230,17 @@ async function run() {
         // ==========================================
         // 9. Payment APIs (Fixed Simulation)
         // ==========================================
+   3. Simulated Payment (Success -> Account Premium)
         app.post('/simulate-payment', verifyToken, async (req, res) => {
             const email = req.decoded.email;
-            const mockPayment = { 
-                email, 
-                amount: 5.00, 
-                transactionId: `SIM_${Date.now()}`, 
-                date: new Date(), 
-                method: 'Simulation' 
-            };
+            const mockPayment = { email, amount: 5, transactionId: `sim_${Date.now()}`, date: new Date() };
+            
             await paymentsCollection.insertOne(mockPayment);
+            // ইউজারের স্ট্যাটাস Premium করা (অ্যাসাইনমেন্টের মেইন শর্ত)
             const result = await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
             res.send({ success: true, result });
         });
+
 
         app.post('/create-payment-intent', verifyToken, async (req, res) => {
             const paymentIntent = await stripe.paymentIntents.create({
