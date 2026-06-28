@@ -9,17 +9,24 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==========================================
-const corsOptions = {
-    origin: [
-        'https://assainment10-client.vercel.app', 
-        'http://localhost:3000'
-    ],
+// 1. CORS & Security (Fixed for Vercel/Render)
+// ==========================================
+app.use(cors({
+    origin: true, 
     credentials: true,
-    optionSuccessStatus: 200,
-};
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
+}));
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // Preflight রিকোয়েস্ট হ্যান্ডেল করার জন্য
+// Manual Preflight Header Injection
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', req.header('Origin'));
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
 app.use(express.json());
 
 // --- MongoDB Connection ---
