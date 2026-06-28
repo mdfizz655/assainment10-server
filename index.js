@@ -5,25 +5,25 @@ require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-const port = process.env.PORT || 5000;
 const app = express();
+const port = process.env.PORT || 5000;
 
 // ==========================================
-// ১. CORS & Middlewares (যাতে ব্লক না হয়)
+// 1. CORS & Security (The "Nuclear" Fix)
 // ==========================================
 app.use(cors({
-    origin: function (origin, callback) {
-        return callback(null, true);
-    },
-    credentials: true
+    origin: true, 
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
 }));
 
-app.options('*', (req, res) => {
+app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', req.header('Origin'));
     res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.header('Access-Control-Allow-Credentials', 'true');
-    res.sendStatus(200);
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
 });
 
 app.use(express.json());
@@ -32,11 +32,7 @@ app.use(express.json());
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ay91vcf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 const client = new MongoClient(uri, {
-    serverApi: {
-        version: ServerApiVersion.v1,
-        strict: true,
-        deprecationErrors: true,
-    }
+    serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
 });
 
 async function run() {
@@ -50,53 +46,51 @@ async function run() {
         const reportsCollection = db.collection("reports");
 
         // ==========================================
-        // ২. JWT & সেশন ম্যানেজমেন্ট
+        // 2. JWT & Auth Middlewares
         // ==========================================
         app.post('/jwt', async (req, res) => {
-            const user = req.body;
-            const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: '1h' });
+            const token = jwt.sign(req.body, process.env.JWT_SECRET, { expiresIn: '1h' });
             res.send({ token });
         });
 
         const verifyToken = (req, res, next) => {
             const authHeader = req.headers.authorization;
-            if (!authHeader) {
-                return res.status(401).send({ message: 'No authorization header found' });
-            }
+            if (!authHeader) return res.status(401).send({ message: 'No authorization header' });
             const token = authHeader.split(' ')[1];
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) {
-                    return res.status(401).send({ message: 'Invalid or expired token' });
-                }
+                if (err) return res.status(401).send({ message: 'Invalid token' });
                 req.decoded = decoded;
                 next();
             });
         };
 
         const verifyAdmin = async (req, res, next) => {
-            const email = req.decoded.email;
-            const user = await usersCollection.findOne({ email });
-            if (user?.role !== 'Admin') return res.status(403).send({ message: 'Forbidden access' });
+            const user = await usersCollection.findOne({ email: req.decoded.email });
+            if (user?.role !== 'Admin') return res.status(403).send({ message: 'Forbidden' });
             next();
         };
 
         // ==========================================
-        // ৩. User & Role APIs
+        // 3. User & Admin APIs
         // ==========================================
         app.post('/users', async (req, res) => {
             const user = req.body;
             const existing = await usersCollection.findOne({ email: user.email });
-            if (existing) return res.send({ message: 'Exists', insertedId: null });
-            const result = await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() });
-            res.send(result);
+            if (existing) return res.send({ message: 'Exists' });
+            res.send(await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() }));
         });
 
         app.get('/users/login-check/:email', async (req, res) => {
             res.send(await usersCollection.findOne({ email: req.params.email }));
         });
 
-        app.get('/users/me/:email', verifyToken, async (req, res) => {
-            res.send(await usersCollection.findOne({ email: req.params.email }));
+        app.get('/admin/all-users', verifyToken, verifyAdmin, async (req, res) => {
+            const result = await usersCollection.find().toArray();
+            res.send(result);
+        });
+
+        app.patch('/admin/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: req.body.role } }));
         });
 
         app.get('/user-stats/:email', verifyToken, async (req, res) => {
@@ -105,24 +99,15 @@ async function run() {
             res.send({ promptCount: count, status: user?.status, role: user?.role });
         });
 
-        app.get('/admin/all-users', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.find().toArray());
-        });
-
-        app.patch('/admin/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: req.body.role } }));
-        });
-
         // ==========================================
-        // ৪. Prompt Management (CRUD & Limits)
+        // 4. Prompt Management (Fixed Add/Update/Delete)
         // ==========================================
         app.post('/add-prompt', verifyToken, async (req, res) => {
-            const user = await usersCollection.findOne({ email: req.decoded.email });
-            const count = await promptsCollection.countDocuments({ creatorEmail: req.decoded.email });
-            if (user.status === 'Free' && count >= 3) {
-                return res.status(403).send({ message: 'limit-reached' });
-            }
-            res.send(await promptsCollection.insertOne({ ...req.body, creatorEmail: req.decoded.email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() }));
+            const email = req.decoded.email;
+            const user = await usersCollection.findOne({ email });
+            const count = await promptsCollection.countDocuments({ creatorEmail: email });
+            if (user.status === 'Free' && count >= 3) return res.status(403).send({ message: 'limit-reached' });
+            res.send(await promptsCollection.insertOne({ ...req.body, creatorEmail: email, status: 'pending', copyCount: 0, createdAt: new Date() }));
         });
 
         app.get('/my-prompts/:email', verifyToken, async (req, res) => {
@@ -142,7 +127,7 @@ async function run() {
         });
 
         // ==========================================
-        // ৫. Interactions (Reviews, Bookmarks, Reports)
+        // 5. Reviews, Bookmarks & Reports
         // ==========================================
         app.post('/reviews', verifyToken, async (req, res) => {
             res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
@@ -177,22 +162,24 @@ async function run() {
         });
 
         // ==========================================
-        // ৬. Marketplace & Featured
+        // 6. Marketplace & Analytics
         // ==========================================
         app.get('/featured-prompts', async (req, res) => {
             res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
         });
 
         app.get('/prompts', async (req, res) => {
-            const { search, category, aiTool, sort } = req.query;
+            const { search, category, aiTool, sort, page = 1, limit = 6 } = req.query;
+            const skip = (parseInt(page) - 1) * parseInt(limit);
             let query = { status: 'approved' };
             if (search) query.title = { $regex: search, $options: 'i' };
             if (category) query.category = category;
             if (aiTool) query.aiTool = aiTool;
             let sortObj = { createdAt: -1 };
             if (sort === 'popular') sortObj = { rating: -1 };
-            const result = await promptsCollection.find(query).sort(sortObj).toArray();
-            res.send({ result });
+            const result = await promptsCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray();
+            const total = await promptsCollection.countDocuments(query);
+            res.send({ result, total });
         });
 
         app.get('/prompts/:id', async (req, res) => {
@@ -200,60 +187,45 @@ async function run() {
         });
 
         // ==========================================
-        // ৭. Payments & Analytics (SURE FIX)
+        // 7. Payment APIs (Real & Fixed Simulation)
         // ==========================================
-        
-        // সিমুলেটেড পেমেন্ট: ডাটাবেস আপডেট এবং এডমিন লগ তৈরি
         app.post('/simulate-payment', verifyToken, async (req, res) => {
             const email = req.decoded.email;
             const user = await usersCollection.findOne({ email });
-            
-            const mockPayment = { 
-                email, 
-                userName: user?.name || "Neural User",
-                amount: 5.00, 
-                transactionId: `SIM_${Date.now()}_${Math.random().toString(36).substr(2, 5).toUpperCase()}`, 
-                date: new Date(), 
-                method: 'Sandbox Simulation' 
-            };
-            
+            const mockPayment = { email, userName: user?.name, amount: 5, transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Simulation' };
             await paymentsCollection.insertOne(mockPayment);
             await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
-            res.send({ success: true, message: "Upgraded Successfully" });
+            res.send({ success: true });
         });
 
         app.post('/create-payment-intent', verifyToken, async (req, res) => {
-            const paymentIntent = await stripe.paymentIntents.create({ 
-                amount: 500, // $5.00
-                currency: 'usd', 
-                payment_method_types: ['card'] 
-            });
+            const paymentIntent = await stripe.paymentIntents.create({ amount: 500, currency: 'usd', payment_method_types: ['card'] });
             res.send({ clientSecret: paymentIntent.client_secret });
         });
 
         app.post('/payments', verifyToken, async (req, res) => {
-            const payment = req.body;
-            await paymentsCollection.insertOne(payment);
-            await usersCollection.updateOne({ email: payment.email }, { $set: { status: 'Premium' } });
+            await paymentsCollection.insertOne(req.body);
+            await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } });
             res.send({ success: true });
         });
 
-        // এডমিনের জন্য পেমেন্ট লিস্ট পাওয়ার এপিআই
-        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
-            const result = await paymentsCollection.find().sort({ date: -1 }).toArray();
-            res.send(result);
-        });
-
+        // ==========================================
+        // 8. Admin Moderation & Aggregation
+        // ==========================================
         app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await promptsCollection.find().toArray());
         });
 
         app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
+            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
         });
 
         app.get('/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await reportsCollection.find().toArray());
+        });
+
+        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await paymentsCollection.find().sort({ date: -1 }).toArray());
         });
 
         app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
@@ -264,18 +236,17 @@ async function run() {
         });
 
         app.get('/creator-stats/:email', verifyToken, async (req, res) => {
-            const email = req.params.email;
             const stats = await promptsCollection.aggregate([
-                { $match: { creatorEmail: email } },
-                { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, totalBookmarks: { $sum: { $ifNull: ["$bookmarkCount", 0] } } } }
+                { $match: { creatorEmail: req.params.email } },
+                { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" } } }
             ]).toArray();
-            const chartData = await promptsCollection.find({ creatorEmail: email }).project({ title: 1, copyCount: 1, bookmarkCount: 1 }).toArray();
-            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, chartData });
+            const chartData = await promptsCollection.find({ creatorEmail: req.params.email }).project({ title: 1, copyCount: 1 }).toArray();
+            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0 }, chartData });
         });
 
-        console.log("Database Operational and Payment Logic Synced! ✅");
+        console.log("PROMPTLY Master Backend Operational ✅");
     } finally { }
 }
 run().catch(console.dir);
-app.get('/', (req, res) => res.send('API Online'));
-app.listen(port, () => console.log(`Server Port ${port}`));
+app.get('/', (req, res) => res.send('API Sync Active'));
+app.listen(port, () => console.log(`Neural Port ${port}`));
