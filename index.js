@@ -5,20 +5,27 @@ require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-const app = express();
 const port = process.env.PORT || 5000;
+const app = express();
 
 // ==========================================
-// 1. CORS Configuration (সবার উপরে থাকবে)
+// ১. CORS & Middlewares (যাতে ব্লক না হয়)
 // ==========================================
 app.use(cors({
-    origin: [
-        'https://assainment10-client.vercel.app', 
-        'http://localhost:3000'
-    ],
+    origin: function (origin, callback) {
+        return callback(null, true);
+    },
     credentials: true
 }));
-app.options('*', cors());
+
+app.options('*', (req, res) => {
+    res.header('Access-Control-Allow-Origin', req.header('Origin'));
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.sendStatus(200);
+});
+
 app.use(express.json());
 
 // --- MongoDB Connection ---
@@ -43,7 +50,7 @@ async function run() {
         const reportsCollection = db.collection("reports");
 
         // ==========================================
-        // 2. JWT & Security Middlewares
+        // ২. JWT & সেশন ম্যানেজমেন্ট
         // ==========================================
         app.post('/jwt', async (req, res) => {
             const user = req.body;
@@ -53,32 +60,42 @@ async function run() {
 
         const verifyToken = (req, res, next) => {
             const authHeader = req.headers.authorization;
-            if (!authHeader) return res.status(401).send({ message: 'unauthorized' });
+            if (!authHeader) {
+                return res.status(401).send({ message: 'No authorization header found' });
+            }
             const token = authHeader.split(' ')[1];
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) return res.status(401).send({ message: 'unauthorized' });
+                if (err) {
+                    return res.status(401).send({ message: 'Invalid or expired token' });
+                }
                 req.decoded = decoded;
                 next();
             });
         };
 
         const verifyAdmin = async (req, res, next) => {
-            const user = await usersCollection.findOne({ email: req.decoded.email });
-            if (user?.role !== 'Admin') return res.status(403).send({ message: 'forbidden' });
+            const email = req.decoded.email;
+            const user = await usersCollection.findOne({ email });
+            if (user?.role !== 'Admin') return res.status(403).send({ message: 'Forbidden access' });
             next();
         };
 
         // ==========================================
-        // 3. User APIs (Auth & Stats)
+        // ৩. User & Role APIs
         // ==========================================
         app.post('/users', async (req, res) => {
             const user = req.body;
             const existing = await usersCollection.findOne({ email: user.email });
             if (existing) return res.send({ message: 'Exists', insertedId: null });
-            res.send(await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() }));
+            const result = await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() });
+            res.send(result);
         });
 
         app.get('/users/login-check/:email', async (req, res) => {
+            res.send(await usersCollection.findOne({ email: req.params.email }));
+        });
+
+        app.get('/users/me/:email', verifyToken, async (req, res) => {
             res.send(await usersCollection.findOne({ email: req.params.email }));
         });
 
@@ -97,16 +114,15 @@ async function run() {
         });
 
         // ==========================================
-        // 4. Prompt Management (Fixed Add Prompt)
+        // ৪. Prompt Management (CRUD & Limits)
         // ==========================================
         app.post('/add-prompt', verifyToken, async (req, res) => {
-            const email = req.decoded.email;
-            const user = await usersCollection.findOne({ email: email });
-            const count = await promptsCollection.countDocuments({ creatorEmail: email });
-            if (user.status === 'Free' && count >= 3) return res.status(403).send({ message: 'limit-reached' });
-
-            const newPrompt = { ...req.body, creatorEmail: email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() };
-            res.send(await promptsCollection.insertOne(newPrompt));
+            const user = await usersCollection.findOne({ email: req.decoded.email });
+            const count = await promptsCollection.countDocuments({ creatorEmail: req.decoded.email });
+            if (user.status === 'Free' && count >= 3) {
+                return res.status(403).send({ message: 'limit-reached' });
+            }
+            res.send(await promptsCollection.insertOne({ ...req.body, creatorEmail: req.decoded.email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() }));
         });
 
         app.get('/my-prompts/:email', verifyToken, async (req, res) => {
@@ -126,45 +142,42 @@ async function run() {
         });
 
         // ==========================================
-        // 5. Payments & Analytics (আপনার ৪MD সমাধান)
+        // ৫. Interactions (Reviews, Bookmarks, Reports)
         // ==========================================
-        
-        // সিমুলেটেড পেমেন্ট এপিআই (Fixed with Transaction ID)
-        app.post('/simulate-payment', verifyToken, async (req, res) => {
-            const email = req.decoded.email;
-            const user = await usersCollection.findOne({ email });
-            
-            const mockPayment = { 
-                email, 
-                userName: user?.name || "Neural User",
-                amount: 5.00, 
-                transactionId: `SIM_${Date.now()}`, 
-                date: new Date(), 
-                method: 'Simulation' 
-            };
-            
-            await paymentsCollection.insertOne(mockPayment);
-            await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
-            res.send({ success: true });
+        app.post('/reviews', verifyToken, async (req, res) => {
+            res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
         });
 
-        app.post('/create-payment-intent', verifyToken, async (req, res) => {
-            const paymentIntent = await stripe.paymentIntents.create({ amount: 500, currency: 'usd', payment_method_types: ['card'] });
-            res.send({ clientSecret: paymentIntent.client_secret });
+        app.get('/reviews/prompt/:id', async (req, res) => {
+            res.send(await reviewsCollection.find({ promptId: req.params.id }).toArray());
         });
 
-        app.post('/payments', verifyToken, async (req, res) => {
-            await paymentsCollection.insertOne(req.body);
-            await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } });
-            res.send({ success: true });
+        app.get('/my-reviews/:email', verifyToken, async (req, res) => {
+            res.send(await reviewsCollection.find({ reviewerEmail: req.params.email }).toArray());
         });
 
-        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await paymentsCollection.find().sort({ date: -1 }).toArray());
+        app.post('/bookmarks', verifyToken, async (req, res) => {
+            const { userEmail, promptId } = req.body;
+            const exists = await bookmarksCollection.findOne({ userEmail, promptId });
+            if (exists) {
+                await bookmarksCollection.deleteOne({ userEmail, promptId });
+                return res.send({ message: "removed" });
+            } else {
+                await bookmarksCollection.insertOne({ ...req.body, date: new Date() });
+                return res.send({ message: "saved" });
+            }
+        });
+
+        app.get('/bookmarks/:email', verifyToken, async (req, res) => {
+            res.send(await bookmarksCollection.find({ userEmail: req.params.email }).toArray());
+        });
+
+        app.post('/reports', verifyToken, async (req, res) => {
+            res.send(await reportsCollection.insertOne({ ...req.body, date: new Date() }));
         });
 
         // ==========================================
-        // 6. Others (Marketplace, Reviews, Reports)
+        // ৬. Marketplace & Featured
         // ==========================================
         app.get('/featured-prompts', async (req, res) => {
             res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
@@ -186,12 +199,61 @@ async function run() {
             res.send(await promptsCollection.findOne({ _id: new ObjectId(req.params.id) }));
         });
 
-        app.post('/reviews', verifyToken, async (req, res) => {
-            res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
+        // ==========================================
+        // ৭. Payments & Analytics (SURE FIX)
+        // ==========================================
+        
+        // সিমুলেটেড পেমেন্ট: ডাটাবেস আপডেট এবং এডমিন লগ তৈরি
+        app.post('/simulate-payment', verifyToken, async (req, res) => {
+            const email = req.decoded.email;
+            const user = await usersCollection.findOne({ email });
+            
+            const mockPayment = { 
+                email, 
+                userName: user?.name || "Neural User",
+                amount: 5.00, 
+                transactionId: `SIM_${Date.now()}_${Math.random().toString(36).substr(2, 5).toUpperCase()}`, 
+                date: new Date(), 
+                method: 'Sandbox Simulation' 
+            };
+            
+            await paymentsCollection.insertOne(mockPayment);
+            await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
+            res.send({ success: true, message: "Upgraded Successfully" });
         });
 
-        app.get('/reviews/prompt/:id', async (req, res) => {
-            res.send(await reviewsCollection.find({ promptId: req.params.id }).toArray());
+        app.post('/create-payment-intent', verifyToken, async (req, res) => {
+            const paymentIntent = await stripe.paymentIntents.create({ 
+                amount: 500, // $5.00
+                currency: 'usd', 
+                payment_method_types: ['card'] 
+            });
+            res.send({ clientSecret: paymentIntent.client_secret });
+        });
+
+        app.post('/payments', verifyToken, async (req, res) => {
+            const payment = req.body;
+            await paymentsCollection.insertOne(payment);
+            await usersCollection.updateOne({ email: payment.email }, { $set: { status: 'Premium' } });
+            res.send({ success: true });
+        });
+
+        // এডমিনের জন্য পেমেন্ট লিস্ট পাওয়ার এপিআই
+        app.get('/admin/all-payments', verifyToken, verifyAdmin, async (req, res) => {
+            const result = await paymentsCollection.find().sort({ date: -1 }).toArray();
+            res.send(result);
+        });
+
+        app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await promptsCollection.find().toArray());
+        });
+
+        app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
+        });
+
+        app.get('/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await reportsCollection.find().toArray());
         });
 
         app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
@@ -201,7 +263,17 @@ async function run() {
             res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
         });
 
-        console.log("Database Operational ✅");
+        app.get('/creator-stats/:email', verifyToken, async (req, res) => {
+            const email = req.params.email;
+            const stats = await promptsCollection.aggregate([
+                { $match: { creatorEmail: email } },
+                { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, totalBookmarks: { $sum: { $ifNull: ["$bookmarkCount", 0] } } } }
+            ]).toArray();
+            const chartData = await promptsCollection.find({ creatorEmail: email }).project({ title: 1, copyCount: 1, bookmarkCount: 1 }).toArray();
+            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, chartData });
+        });
+
+        console.log("Database Operational and Payment Logic Synced! ✅");
     } finally { }
 }
 run().catch(console.dir);
