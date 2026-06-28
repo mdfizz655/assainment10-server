@@ -5,22 +5,27 @@ require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-const app = express();
+
 const port = process.env.PORT || 5000;
 
-// ==========================================
-// ১. নতুন CORS কনফিগারেশন (সবার উপরে বসানো হয়েছে)
-// ==========================================
+const app = express();
+
+// ১. এই কোডটি আগের সব CORS কোড সরিয়ে দিয়ে বসান
 app.use(cors({
     origin: function (origin, callback) {
-        // সব অরিজিন এলাউ করা হচ্ছে যাতে লাইভ সাইটে সমস্যা না হয়
-        return callback(null, true);
+        return callback(null, true); // সব সোর্সকে পারমিশন দেওয়া হলো
     },
     credentials: true
 }));
 
-// ২. প্রি-ফ্লাইট রিকোয়েস্ট
-app.options('*', cors()); 
+// ২. প্রি-ফ্লাইট রিকোয়েস্টের জন্য এটি অবশ্যই লাগবে
+app.options('*', (req, res) => {
+    res.header('Access-Control-Allow-Origin', req.header('Origin'));
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.sendStatus(200);
+});
 
 app.use(express.json());
 
