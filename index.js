@@ -9,16 +9,19 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==========================================
-// 1. CORS Configuration (Fixed for Vercel/Render)
+// ১. নতুন CORS কনফিগারেশন (সবার উপরে বসানো হয়েছে)
 // ==========================================
 app.use(cors({
-    origin: [
-        'https://assainment10-client.vercel.app', 
-        'http://localhost:3000'
-    ],
+    origin: function (origin, callback) {
+        // সব অরিজিন এলাউ করা হচ্ছে যাতে লাইভ সাইটে সমস্যা না হয়
+        return callback(null, true);
+    },
     credentials: true
 }));
-app.options('*', cors());
+
+// ২. প্রি-ফ্লাইট রিকোয়েস্ট
+app.options('*', cors()); 
+
 app.use(express.json());
 
 // --- MongoDB Connection ---
@@ -43,7 +46,7 @@ async function run() {
         const reportsCollection = db.collection("reports");
 
         // ==========================================
-        // 2. JWT & Auth Middlewares
+        // ২. JWT & সেশন ম্যানেজমেন্ট
         // ==========================================
         app.post('/jwt', async (req, res) => {
             const user = req.body;
@@ -51,13 +54,17 @@ async function run() {
             res.send({ token });
         });
 
+        // নতুন verifyToken লজিক (এখানে আপডেট করা হয়েছে)
         const verifyToken = (req, res, next) => {
-            if (!req.headers.authorization) {
-                return res.status(401).send({ message: 'Unauthorized access' });
+            const authHeader = req.headers.authorization;
+            if (!authHeader) {
+                return res.status(401).send({ message: 'No authorization header found' });
             }
-            const token = req.headers.authorization.split(' ')[1];
+            const token = authHeader.split(' ')[1];
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) return res.status(401).send({ message: 'Unauthorized access' });
+                if (err) {
+                    return res.status(401).send({ message: 'Invalid or expired token' });
+                }
                 req.decoded = decoded;
                 next();
             });
@@ -71,16 +78,21 @@ async function run() {
         };
 
         // ==========================================
-        // 3. User & Stats APIs
+        // ৩. User & Role APIs
         // ==========================================
         app.post('/users', async (req, res) => {
             const user = req.body;
             const existing = await usersCollection.findOne({ email: user.email });
             if (existing) return res.send({ message: 'Exists', insertedId: null });
-            res.send(await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() }));
+            const result = await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() });
+            res.send(result);
         });
 
         app.get('/users/login-check/:email', async (req, res) => {
+            res.send(await usersCollection.findOne({ email: req.params.email }));
+        });
+
+        app.get('/users/me/:email', verifyToken, async (req, res) => {
             res.send(await usersCollection.findOne({ email: req.params.email }));
         });
 
@@ -99,26 +111,15 @@ async function run() {
         });
 
         // ==========================================
-        // 4. Prompt Management (Fixed CRUD & Limit)
+        // ৪. Prompt Management (CRUD & Limits)
         // ==========================================
         app.post('/add-prompt', verifyToken, async (req, res) => {
-            const email = req.decoded.email;
-            const user = await usersCollection.findOne({ email: email });
-            const count = await promptsCollection.countDocuments({ creatorEmail: email });
-
+            const user = await usersCollection.findOne({ email: req.decoded.email });
+            const count = await promptsCollection.countDocuments({ creatorEmail: req.decoded.email });
             if (user.status === 'Free' && count >= 3) {
                 return res.status(403).send({ message: 'limit-reached' });
             }
-
-            const newPrompt = { 
-                ...req.body, 
-                creatorEmail: email, 
-                status: 'pending', 
-                copyCount: 0, 
-                rating: 0, 
-                createdAt: new Date() 
-            };
-            res.send(await promptsCollection.insertOne(newPrompt));
+            res.send(await promptsCollection.insertOne({ ...req.body, creatorEmail: req.decoded.email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() }));
         });
 
         app.get('/my-prompts/:email', verifyToken, async (req, res) => {
@@ -138,7 +139,7 @@ async function run() {
         });
 
         // ==========================================
-        // 5. Interaction APIs (Reviews, Bookmarks, Reports)
+        // ৫. Interactions (Reviews, Bookmarks, Reports)
         // ==========================================
         app.post('/reviews', verifyToken, async (req, res) => {
             res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
@@ -153,14 +154,14 @@ async function run() {
         });
 
         app.post('/bookmarks', verifyToken, async (req, res) => {
-            const query = { userEmail: req.body.userEmail, promptId: req.body.promptId };
-            const exists = await bookmarksCollection.findOne(query);
+            const { userEmail, promptId } = req.body;
+            const exists = await bookmarksCollection.findOne({ userEmail, promptId });
             if (exists) {
-                await bookmarksCollection.deleteOne(query);
-                res.send({ message: "removed" });
+                await bookmarksCollection.deleteOne({ userEmail, promptId });
+                return res.send({ message: "removed" });
             } else {
                 await bookmarksCollection.insertOne({ ...req.body, date: new Date() });
-                res.send({ message: "saved" });
+                return res.send({ message: "saved" });
             }
         });
 
@@ -173,7 +174,7 @@ async function run() {
         });
 
         // ==========================================
-        // 6. Marketplace & Home APIs
+        // ৬. Marketplace & Featured
         // ==========================================
         app.get('/featured-prompts', async (req, res) => {
             res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
@@ -196,14 +197,11 @@ async function run() {
         });
 
         // ==========================================
-        // 7. Payment APIs (Real & Simulated)
+        // ৭. Payments & Analytics
         // ==========================================
         app.post('/simulate-payment', verifyToken, async (req, res) => {
-            const email = req.decoded.email;
-            const mockPayment = { email, amount: 5.00, transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Simulation' };
-            await paymentsCollection.insertOne(mockPayment);
-            await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
-            res.send({ success: true });
+            await paymentsCollection.insertOne({ email: req.decoded.email, amount: 5, date: new Date(), transactionId: `sim_${Date.now()}` });
+            res.send(await usersCollection.updateOne({ email: req.decoded.email }, { $set: { status: 'Premium' } }));
         });
 
         app.post('/create-payment-intent', verifyToken, async (req, res) => {
@@ -213,19 +211,15 @@ async function run() {
 
         app.post('/payments', verifyToken, async (req, res) => {
             await paymentsCollection.insertOne(req.body);
-            await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } });
-            res.send({ success: true });
+            res.send(await usersCollection.updateOne({ email: req.body.email }, { $set: { status: 'Premium' } }));
         });
 
-        // ==========================================
-        // 8. Admin Moderation & Stats
-        // ==========================================
         app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await promptsCollection.find().toArray());
         });
 
         app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
+            res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, feedback: req.body.feedback || "" } }));
         });
 
         app.get('/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
@@ -239,9 +233,6 @@ async function run() {
             res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
         });
 
-        // ==========================================
-        // 9. Creator Dashboard Data
-        // ==========================================
         app.get('/creator-stats/:email', verifyToken, async (req, res) => {
             const email = req.params.email;
             const stats = await promptsCollection.aggregate([
@@ -252,9 +243,9 @@ async function run() {
             res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, chartData });
         });
 
-        console.log("PROMPTLY Master Backend Ready ✅");
+        console.log("Master Neural Backend Synced ✅");
     } finally { }
 }
 run().catch(console.dir);
 app.get('/', (req, res) => res.send('API Online'));
-app.listen(port, () => console.log(`Neural Port ${port}`));
+app.listen(port, () => console.log(`Server Port ${port}`));
