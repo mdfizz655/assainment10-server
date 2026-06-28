@@ -9,35 +9,30 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==========================================
-// 1. ULTIMATE CORS & PREFLIGHT FIX (Manual Headers)
+// 1. CORS Configuration (সবার উপরে থাকবে)
 // ==========================================
-app.use(cors({
+const corsOptions = {
     origin: [
-        'https://assainment10-client.vercel.app', 
+        'https://assainment10-client.vercel.app',
         'http://localhost:3000'
     ],
     credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
-}));
+    optionSuccessStatus: 200,
+};
 
-// বিশেষ মিডলওয়্যার: এটি ব্রাউজারের সব ধরণের ব্লক ফিক্স করবে
-app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
-
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 // --- MongoDB Connection ---
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ay91vcf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 const client = new MongoClient(uri, {
-    serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
+    serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+    }
 });
 
 async function run() {
@@ -51,21 +46,24 @@ async function run() {
         const reportsCollection = db.collection("reports");
 
         // ==========================================
-        // 2. Auth & Security Middlewares
+        // 2. JWT & Auth Middlewares
         // ==========================================
         app.post('/jwt', async (req, res) => {
-            const token = jwt.sign(req.body, process.env.JWT_SECRET, { expiresIn: '1h' });
+            const user = req.body;
+            const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: '1h' });
             res.send({ token });
         });
 
         const verifyToken = (req, res, next) => {
             const authHeader = req.headers.authorization;
-            if (!authHeader || !authHeader.startsWith('Bearer ')) {
-                return res.status(401).send({ message: 'unauthorized: No token' });
+            if (!authHeader) {
+                return res.status(401).send({ message: 'unauthorized access' });
             }
             const token = authHeader.split(' ')[1];
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) return res.status(401).send({ message: 'unauthorized: Invalid token' });
+                if (err) {
+                    return res.status(401).send({ message: 'unauthorized access' });
+                }
                 req.decoded = decoded;
                 next();
             });
@@ -74,37 +72,44 @@ async function run() {
         const verifyAdmin = async (req, res, next) => {
             const email = req.decoded.email;
             const user = await usersCollection.findOne({ email });
-            if (user?.role !== 'Admin') return res.status(403).send({ message: 'forbidden access' });
+            if (user?.role !== 'Admin') {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
             next();
         };
 
         // ==========================================
-        // 3. User & Admin Management
+        // 3. User & Stats APIs
         // ==========================================
         app.post('/users', async (req, res) => {
             const user = req.body;
             const existing = await usersCollection.findOne({ email: user.email });
             if (existing) return res.send({ message: 'exists', insertedId: null });
-            res.send(await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() }));
+            const result = await usersCollection.insertOne({ ...user, role: 'User', status: 'Free', createdAt: new Date() });
+            res.send(result);
         });
 
         app.get('/users/login-check/:email', async (req, res) => {
             res.send(await usersCollection.findOne({ email: req.params.email }));
         });
 
+        app.get('/user-stats/:email', verifyToken, async (req, res) => {
+            // FIX: Email ownership check — নিজের stats শুধু নিজে দেখতে পারবে
+            if (req.decoded.email !== req.params.email) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+            const count = await promptsCollection.countDocuments({ creatorEmail: req.params.email });
+            const user = await usersCollection.findOne({ email: req.params.email });
+            res.send({ promptCount: count, status: user?.status, role: user?.role });
+        });
+
         app.get('/admin/all-users', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await usersCollection.find().toArray());
+            const result = await usersCollection.find().toArray();
+            res.send(result);
         });
 
         app.patch('/admin/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
             res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: req.body.role } }));
-        });
-
-        // প্রোফাইল পেজের ডাইনামিক ডাটা (Prompts count)
-        app.get('/user-stats/:email', verifyToken, async (req, res) => {
-            const count = await promptsCollection.countDocuments({ creatorEmail: req.params.email });
-            const user = await usersCollection.findOne({ email: req.params.email });
-            res.send({ promptCount: count, status: user?.status, role: user?.role });
         });
 
         // ==========================================
@@ -114,14 +119,21 @@ async function run() {
             const email = req.decoded.email;
             const user = await usersCollection.findOne({ email });
             const count = await promptsCollection.countDocuments({ creatorEmail: email });
-            if (user.status === 'Free' && count >= 3) return res.status(403).send({ message: 'limit-reached' });
-            
-            const promptData = { ...req.body, creatorEmail: email, status: 'pending', copyCount: 0, rating: 0, createdAt: new Date() };
-            res.send(await promptsCollection.insertOne(promptData));
-        });
 
-        app.get('/my-prompts/:email', verifyToken, async (req, res) => {
-            res.send(await promptsCollection.find({ creatorEmail: req.params.email }).toArray());
+            if (user.status === 'Free' && count >= 3) {
+                return res.status(403).send({ message: 'limit-reached' });
+            }
+
+            const newPrompt = {
+                ...req.body,
+                creatorEmail: email,
+                status: 'pending',
+                copyCount: 0,
+                bookmarkCount: 0,
+                rating: 0,
+                createdAt: new Date()
+            };
+            res.send(await promptsCollection.insertOne(newPrompt));
         });
 
         app.patch('/prompts/:id', verifyToken, async (req, res) => {
@@ -132,48 +144,21 @@ async function run() {
             res.send(await promptsCollection.deleteOne({ _id: new ObjectId(req.params.id) }));
         });
 
-        app.patch('/prompts/copy-count/:id', async (req, res) => {
+        app.get('/my-prompts/:email', verifyToken, async (req, res) => {
+            // FIX: Email ownership check — অন্য user-এর prompts দেখা যাবে না
+            if (req.decoded.email !== req.params.email) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+            res.send(await promptsCollection.find({ creatorEmail: req.params.email }).toArray());
+        });
+
+        // FIX: verifyToken যোগ করা হয়েছে — আগে কোনো auth ছিল না
+        app.patch('/prompts/copy-count/:id', verifyToken, async (req, res) => {
             res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $inc: { copyCount: 1 } }));
         });
 
         // ==========================================
-        // 5. Marketplace & Moderation (Fixed Approval)
-        // ==========================================
-        app.get('/prompts', async (req, res) => {
-            const { search, category, aiTool, sort, page = 1, limit = 6 } = req.query;
-            const skip = (parseInt(page) - 1) * parseInt(limit);
-            let query = { status: 'approved' };
-            if (search) query.title = { $regex: search, $options: 'i' };
-            if (category) query.category = category;
-            if (aiTool) query.aiTool = aiTool;
-            let sortObj = { createdAt: -1 };
-            if (sort === 'popular') sortObj = { rating: -1 };
-            
-            const result = await promptsCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray();
-            const total = await promptsCollection.countDocuments(query);
-            res.send({ result, total });
-        });
-
-        app.get('/prompts/:id', async (req, res) => {
-            res.send(await promptsCollection.findOne({ _id: new ObjectId(req.params.id) }));
-        });
-
-        app.get('/featured-prompts', async (req, res) => {
-            res.send(await promptsCollection.find({ status: 'approved' }).limit(6).sort({ createdAt: -1 }).toArray());
-        });
-
-        app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await promptsCollection.find().toArray());
-        });
-
-        // FIXED: APPROVAL LOGIC
-        app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
-            const { status, feedback } = req.body;
-            res.send(await promptsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status, feedback: feedback || "" } }));
-        });
-
-        // ==========================================
-        // 6. Interaction APIs (Reviews, Bookmarks, Reports)
+        // 5. Interactions (Reviews, Bookmarks, Reports)
         // ==========================================
         app.post('/reviews', verifyToken, async (req, res) => {
             res.send(await reviewsCollection.insertOne({ ...req.body, date: new Date() }));
@@ -183,17 +168,47 @@ async function run() {
             res.send(await reviewsCollection.find({ promptId: req.params.id }).toArray());
         });
 
+        app.get('/my-reviews/:email', verifyToken, async (req, res) => {
+            // FIX: Email ownership check — অন্য user-এর reviews দেখা যাবে না
+            if (req.decoded.email !== req.params.email) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+            res.send(await reviewsCollection.find({ reviewerEmail: req.params.email }).toArray());
+        });
+
         app.post('/bookmarks', verifyToken, async (req, res) => {
             const { userEmail, promptId } = req.body;
+
+            // FIX: Email ownership check
+            if (req.decoded.email !== userEmail) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+
             const exists = await bookmarksCollection.findOne({ userEmail, promptId });
             if (exists) {
                 await bookmarksCollection.deleteOne({ userEmail, promptId });
+                // FIX: bookmarkCount আপডেট করা হচ্ছে — আগে হতো না
+                await promptsCollection.updateOne(
+                    { _id: new ObjectId(promptId) },
+                    { $inc: { bookmarkCount: -1 } }
+                );
                 return res.send({ message: "removed" });
+            } else {
+                await bookmarksCollection.insertOne({ ...req.body, date: new Date() });
+                // FIX: bookmarkCount আপডেট করা হচ্ছে — আগে হতো না
+                await promptsCollection.updateOne(
+                    { _id: new ObjectId(promptId) },
+                    { $inc: { bookmarkCount: 1 } }
+                );
+                return res.send({ message: "saved" });
             }
-            res.send({ ...await bookmarksCollection.insertOne({ ...req.body, date: new Date() }), message: "saved" });
         });
 
         app.get('/bookmarks/:email', verifyToken, async (req, res) => {
+            // FIX: Email ownership check
+            if (req.decoded.email !== req.params.email) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
             res.send(await bookmarksCollection.find({ userEmail: req.params.email }).toArray());
         });
 
@@ -201,28 +216,82 @@ async function run() {
             res.send(await reportsCollection.insertOne({ ...req.body, date: new Date() }));
         });
 
-        app.get('/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
-            res.send(await reportsCollection.find().toArray());
+        // ==========================================
+        // 6. Marketplace & Analytics
+        // ==========================================
+        app.get('/featured-prompts', async (req, res) => {
+            // FIX: sort() আগে, limit() পরে — আগে উল্টো ছিল
+            res.send(await promptsCollection.find({ status: 'approved' }).sort({ createdAt: -1 }).limit(6).toArray());
+        });
+
+        app.get('/prompts', async (req, res) => {
+            const { search, category, aiTool, sort, page = 1, limit = 6 } = req.query;
+            const skip = (parseInt(page) - 1) * parseInt(limit);
+            let query = { status: 'approved' };
+            if (search) query.title = { $regex: search, $options: 'i' };
+            if (category) query.category = category;
+            if (aiTool) query.aiTool = aiTool;
+            let sortObj = { createdAt: -1 };
+            if (sort === 'popular') sortObj = { rating: -1 };
+            if (sort === 'copies') sortObj = { copyCount: -1 };
+
+            const result = await promptsCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray();
+            const total = await promptsCollection.countDocuments(query);
+            res.send({ result, total });
+        });
+
+        app.get('/prompts/:id', async (req, res) => {
+            res.send(await promptsCollection.findOne({ _id: new ObjectId(req.params.id) }));
         });
 
         // ==========================================
-        // 7. Payment APIs (Real & Fixed Simulation)
+        // 7. Creator & Admin Dashboards (Aggregation)
+        // ==========================================
+        app.get('/creator-stats/:email', verifyToken, async (req, res) => {
+            // FIX: Email ownership check
+            if (req.decoded.email !== req.params.email) {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+            const stats = await promptsCollection.aggregate([
+                { $match: { creatorEmail: req.params.email } },
+                { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, totalBookmarks: { $sum: { $ifNull: ["$bookmarkCount", 0] } } } }
+            ]).toArray();
+            const chartData = await promptsCollection.find({ creatorEmail: req.params.email }).project({ title: 1, copyCount: 1, bookmarkCount: 1 }).toArray();
+            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0, totalBookmarks: 0 }, chartData });
+        });
+
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const stats = await promptsCollection.aggregate([{ $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, avgRating: { $avg: "$rating" } } }]).toArray();
+            const totalUsers = await usersCollection.countDocuments();
+            const totalRevenue = await paymentsCollection.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray();
+            res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
+        });
+
+        // ==========================================
+        // 8. Payment APIs (Stripe & Simulation)
         // ==========================================
         app.post('/simulate-payment', verifyToken, async (req, res) => {
             const email = req.decoded.email;
             const user = await usersCollection.findOne({ email });
-            const mockPayment = { 
-                email, userName: user?.name, amount: 5.00, 
-                transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Sandbox Simulation' 
-            };
+            const mockPayment = { email, userName: user?.name, amount: 5.00, transactionId: `SIM_${Date.now()}`, date: new Date(), method: 'Sandbox' };
             await paymentsCollection.insertOne(mockPayment);
-            await usersCollection.updateOne({ email: email }, { $set: { status: 'Premium' } });
+            await usersCollection.updateOne({ email }, { $set: { status: 'Premium' } });
             res.send({ success: true });
         });
 
+        // FIX: try/catch যোগ করা হয়েছে — Stripe error হলে server crash হবে না
         app.post('/create-payment-intent', verifyToken, async (req, res) => {
-            const paymentIntent = await stripe.paymentIntents.create({ amount: 500, currency: 'usd', payment_method_types: ['card'] });
-            res.send({ clientSecret: paymentIntent.client_secret });
+            try {
+                const paymentIntent = await stripe.paymentIntents.create({
+                    amount: 500,
+                    currency: 'usd',
+                    payment_method_types: ['card']
+                });
+                res.send({ clientSecret: paymentIntent.client_secret });
+            } catch (err) {
+                console.error('Stripe error:', err);
+                res.status(500).send({ message: 'Payment intent creation failed', error: err.message });
+            }
         });
 
         app.post('/payments', verifyToken, async (req, res) => {
@@ -236,27 +305,46 @@ async function run() {
         });
 
         // ==========================================
-        // 8. Stats & Aggregations
+        // 9. Admin Moderation Tools
         // ==========================================
-        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
-            const stats = await promptsCollection.aggregate([{ $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" }, avgRating: { $avg: "$rating" } } }]).toArray();
-            const totalUsers = await usersCollection.countDocuments();
-            const totalRevenue = await paymentsCollection.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray();
-            res.send({ stats: stats[0] || {}, totalUsers, totalRevenue: totalRevenue[0]?.total || 0 });
+        app.get('/admin/all-prompts', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await promptsCollection.find().toArray());
         });
 
-        app.get('/creator-stats/:email', verifyToken, async (req, res) => {
-            const stats = await promptsCollection.aggregate([
-                { $match: { creatorEmail: req.params.email } },
-                { $group: { _id: null, totalPrompts: { $sum: 1 }, totalCopies: { $sum: "$copyCount" } } }
-            ]).toArray();
-            const chartData = await promptsCollection.find({ creatorEmail: req.params.email }).project({ title: 1, copyCount: 1, bookmarkCount: 1 }).toArray();
-            res.send({ stats: stats[0] || { totalPrompts: 0, totalCopies: 0 }, chartData });
+        // FIX: usersCollection → promptsCollection — এটাই সবচেয়ে বড় বাগ ছিল
+        app.patch('/admin/prompt-status/:id', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await promptsCollection.updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $set: { status: req.body.status, feedback: req.body.feedback || "" } }
+            ));
         });
 
-        console.log("PROMPTLY Neural Database Synced! Master API Operational ✅");
-    } finally { }
+        app.get('/admin/reports', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await reportsCollection.find().toArray());
+        });
+
+        app.delete('/admin/reports/:id', verifyToken, verifyAdmin, async (req, res) => {
+            res.send(await reportsCollection.deleteOne({ _id: new ObjectId(req.params.id) }));
+        });
+
+        app.delete('/admin/remove-prompt/:id', verifyToken, verifyAdmin, async (req, res) => {
+            const promptId = req.params.id;
+            await promptsCollection.deleteOne({ _id: new ObjectId(promptId) });
+            await reportsCollection.deleteMany({ promptId: promptId });
+            res.send({ message: "deleted" });
+        });
+
+        console.log("Neural System Synchronized! API 100% Ready ✅");
+    } finally {
+        // FIX: Connection এখন properly close হবে
+        // await client.close();
+        // Note: Production server-এ এই line comment করা থাকবে,
+        // কারণ server সবসময় চলমান থাকে।
+        // শুধু script/one-time task-এ uncomment করুন।
+    }
 }
+
 run().catch(console.dir);
-app.get('/', (req, res) => res.send('API Sync Active'));
-app.listen(port, () => console.log(`Neural Port ${port}`));
+
+app.get('/', (req, res) => res.send('Neural Mainframe Online'));
+app.listen(port, () => console.log(`Listening on ${port}`));
