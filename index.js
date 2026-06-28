@@ -9,30 +9,18 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==========================================
-// 1. CORS & Security (Fixed for Vercel/Render)
-// ==========================================
-app.use(cors({
-    origin: function (origin, callback) {
-        // টেস্টিং এর জন্য সব অরিজিন এলাউ করা হচ্ছে যাতে লাইভ সাইটে সমস্যা না হয়
-        return callback(null, true);
-    },
+const corsOptions = {
+    origin: [
+        'https://assainment10-client.vercel.app', 
+        'http://localhost:3000'
+    ],
     credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
+    optionSuccessStatus: 200,
+};
 
-// ম্যানুয়াল হেডার ইনজেকশন (যাতে ব্রাউজার কোনোভাবেই ব্লক না করে)
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', req.header('Origin'));
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
-});
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // Preflight রিকোয়েস্ট হ্যান্ডেল করার জন্য
+app.use(express.json());
 
 // --- MongoDB Connection ---
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ay91vcf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
